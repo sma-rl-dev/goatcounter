@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# GoatCounter - Tester Environment CLI.
+#
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status
+set -euo pipefail
+
+RUN_ID="default"
+PORT="18181"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-goatcounter}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+# Deterministic credentials. Single-site install: any Host header falls back
+# to this site, so http://localhost:$PORT works despite the vhost.
+VHOST="${GOATCOUNTER_VHOST:-goatcounter.localhost}"
+ADMIN_EMAIL="${GOATCOUNTER_ADMIN_EMAIL:-admin@tester.local}"
+ADMIN_PASSWORD="${GOATCOUNTER_ADMIN_PASSWORD:-TesterEnv123!}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    CONTAINER_NAME="tester-env-goatcounter${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-goatcounter:dev}"
+    DATA_VOLUME="goatcounter-data${suffix}"
+}
+
+wait_for_http() {
+    local i
+    for i in $(seq 1 60); do
+        if curl -fs -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "Timed out waiting for http://localhost:${PORT}/" >&2
+    return 1
+}
+
+cmd_deploy() {
+    echo "==> Building Docker image ${IMAGE_NAME}..."
+    docker build \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    if docker ps -a --format "{{.Names}}" | grep -qx "${CONTAINER_NAME}"; then
+        echo "==> Removing existing container ${CONTAINER_NAME}..."
+        docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+        docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    fi
+
+    echo "==> Starting container on port ${PORT}..."
+    docker volume create \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        "${DATA_VOLUME}" >/dev/null
+    docker run -d --name "${CONTAINER_NAME}" \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        -p "${PORT}:8080" \
+        -v "${DATA_VOLUME}:/home/goatcounter/goatcounter-data" \
+        "${IMAGE_NAME}"
+
+    echo "==> Waiting for app to respond..."
+    wait_for_http
+
+    echo "==> Creating site + admin user (idempotent)..."
+    if docker exec "${CONTAINER_NAME}" goatcounter db create site \
+        -vhost="${VHOST}" \
+        -user.email="${ADMIN_EMAIL}" \
+        -user.password="${ADMIN_PASSWORD}" 2>&1 | tee /tmp/gc-create-site.log | grep -qi "already exists\|duplicate\|UNIQUE"; then
+        echo "==> Site already exists; leaving existing data in place."
+    fi
+
+    echo "==> Deployment complete. App running at http://localhost:${PORT}"
+    echo "==> Login: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+}
+
+VIEWER_EMAIL="viewer@tester.local"
+VIEWER_PASSWORD="ViewerEnv123!"
+SEED_TOKEN_NAME="tester-env-seed"
+# Expected deterministic seed totals (pageviews per path + grand total).
+# Hit dates are relative to seed time (last 7 days) so the default week-view
+# dashboard stays populated; counts and names are the stable assertions.
+SEED_TOTAL=23
+
+# seed_rows: dayoff|HH:MM|session#|location|ua-key|size|referrer|path|title
+# Theme: docs/product site for fictional SaaS "Acme Forms".
+# NOTE: hit_counts counts only the first visit per (session, path) — a repeat
+# visit to the same path in the same session never counts, even in a
+# different hour. Every row below keeps a distinct (session, path) pair.
+seed_rows() {
+    cat <<'ROWS'
+0|10:05|1|US|chromewin|1920,1080,1|https://www.google.com/|/|Home
+0|10:12|1|US|chromewin|1920,1080,1|https://www.google.com/|/pricing|Pricing
+0|10:19|1|US|chromewin|1920,1080,1|https://www.google.com/|/contact|Contact
+0|14:20|2|DE|firefoxlinux|1920,1080,1|https://news.ycombinator.com/|/blog/launch|Launch announcement
+0|14:27|2|DE|firefoxlinux|1920,1080,1|https://news.ycombinator.com/|/|Home
+0|14:35|2|DE|firefoxlinux|1920,1080,1|https://news.ycombinator.com/|/pricing|Pricing
+1|09:40|3|US|safarimac|1440,900,2||/docs/getting-started|Getting started
+1|09:52|3|US|safarimac|1440,900,2||/docs/api|API reference
+2|11:25|4|NL|chromelinux|1920,1080,1|https://github.com/|/docs/getting-started|Getting started
+2|11:31|4|NL|chromelinux|1920,1080,1|https://github.com/|/docs/api|API reference
+2|12:44|11|NL|chromelinux|1920,1080,1|https://github.com/|/docs/getting-started|Getting started
+2|18:02|5|IN|chromeandroid|390,844,3|https://x.com/|/|Home
+2|18:09|5|IN|chromeandroid|390,844,3|https://x.com/|/blog/launch|Launch announcement
+3|13:15|6|GB|safariiphone|390,844,3||/pricing|Pricing
+3|13:22|6|GB|safariiphone|390,844,3||/contact|Contact
+4|08:50|7|FR|firefoxwin|1920,1080,1|https://www.bing.com/|/docs/api|API reference
+5|16:30|8|BR|chromewin|1920,1080,1||/|Home
+5|16:36|8|BR|chromewin|1920,1080,1||/pricing|Pricing
+5|17:41|8|BR|chromewin|1920,1080,1||/blog/launch|Launch announcement
+5|17:55|8|BR|chromewin|1920,1080,1||/contact|Contact
+6|09:05|9|US|edgewin|1920,1080,1|https://www.google.com/|/docs/getting-started|Getting started
+6|20:45|10|JP|safarimac|1440,900,2|https://news.ycombinator.com/|/blog/launch|Launch announcement
+6|20:58|10|JP|safarimac|1440,900,2|https://news.ycombinator.com/|/docs/getting-started|Getting started
+ROWS
+}
+
+seed_ua() {
+    case "$1" in
+        chromewin)    echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" ;;
+        firefoxlinux) echo "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0" ;;
+        safarimac)    echo "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15" ;;
+        chromelinux)  echo "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" ;;
+        chromeandroid) echo "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36" ;;
+        safariiphone) echo "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1" ;;
+        firefoxwin)   echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0" ;;
+        edgewin)      echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0" ;;
+    esac
+}
+
+db_query() {
+    docker exec "${CONTAINER_NAME}" goatcounter db query -format csv "$1" 2>/dev/null
+}
+
+db_count_hits() {
+    db_query "select coalesce(sum(total),0) from hit_counts" | sed -n 2p | tr -d '\r '
+}
+
+cmd_seed() {
+    if ! docker ps --format "{{.Names}}" | grep -qx "${CONTAINER_NAME}"; then
+        echo "FAIL: container ${CONTAINER_NAME} is not running; run './tester-env deploy' first." >&2
+        return 1
+    fi
+
+    # 1. Deterministic read-only second user (preserves any other existing users,
+    #    e.g. the incidental browser-smoke user; reset wipes all for a clean base).
+    if docker exec "${CONTAINER_NAME}" goatcounter db show user -find "${VIEWER_EMAIL}" 2>/dev/null | grep -q "${VIEWER_EMAIL}"; then
+        echo "==> Viewer user ${VIEWER_EMAIL} already exists; leaving in place."
+    else
+        echo "==> Creating read-only viewer user ${VIEWER_EMAIL}..."
+        docker exec "${CONTAINER_NAME}" goatcounter db create user \
+            -site 1 -email "${VIEWER_EMAIL}" -access readonly -password "${VIEWER_PASSWORD}"
+    fi
+
+    # 2. API token for the CSV import (doubles as the config-element fixture).
+    if db_query "select name from api_tokens where name='${SEED_TOKEN_NAME}'" | grep -q "${SEED_TOKEN_NAME}"; then
+        echo "==> API token ${SEED_TOKEN_NAME} already exists; leaving in place."
+    else
+        echo "==> Creating API token ${SEED_TOKEN_NAME} (count perm)..."
+        docker exec "${CONTAINER_NAME}" goatcounter db create apitoken \
+            -user 1 -name "${SEED_TOKEN_NAME}" -perm count
+    fi
+
+    # 3. Hit data: idempotent on non-empty analytics (reset first for a clean reseed).
+    local have
+    have="$(db_count_hits)"
+    if [[ "${have}" != "0" && -n "${have}" ]]; then
+        echo "==> Analytics already present (${have} pageviews); skipping import."
+        echo "==> Run './tester-env reset && ./tester-env deploy && ./tester-env seed' for a clean reseed."
+        return 0
+    fi
+
+    echo "==> Generating deterministic seed CSV (23 pageviews, 11 sessions, 6 paths)..."
+    local csv tmp
+    tmp="$(mktemp -d)"
+    csv="${tmp}/seed.csv"
+    {
+        echo "2Path,Title,Event,UserAgent,Browser,System,Session,Bot,Referrer,Referrer scheme,Screen size,Location,FirstVisit,Date"
+        seed_rows | while IFS='|' read -r dayoff hm sess loc ua size ref path title; do
+            # +1 day (cap 6): "today" rows would otherwise land in the future
+            # when seed runs early in the UTC day, and GoatCounter rejects
+            # future hits (Hit.Validate: CreatedAt.After(now+5s)). Minimum
+            # past margin ~9.5h; max age ~6d8h so the week view stays populated.
+            effday="$((dayoff + 1))"
+            if [[ "${effday}" -gt 6 ]]; then effday=6; fi
+            dt="$(date -u -d "${effday} days ago ${hm}" +%Y-%m-%dT%H:%M:%SZ)"
+            # Session must be H-L hex: Uint128.Parse requires a "-" and
+            # String() emits "H-L", so a bare 32-hex blob parses to zero and
+            # collapses all rows into one session (hit_counts counts only
+            # FirstVisit per session+path+hour -> 6 pageviews). "N-0" keeps
+            # the 10 deterministic sessions distinct.
+            sessid="$(printf '%x-0' "${sess}")"
+            printf '%s,%s,0,"%s",,,%s,0,%s,h,"%s",%s,1,%s\n' \
+                "${path}" "${title}" "$(seed_ua "${ua}")" "${sessid}" \
+                "${ref}" "${size}" "${loc}" "${dt}"
+        done
+    } > "${csv}"
+    echo "==> Importing $(($(wc -l < "${csv}") - 1)) rows via 'goatcounter import'..."
+    docker cp "${csv}" "${CONTAINER_NAME}:/tmp/tester-env-seed.csv"
+    local token
+    token="$(db_query "select token from api_tokens where name='${SEED_TOKEN_NAME}'" | sed -n 2p | tr -d '\r')"
+    docker exec -e GOATCOUNTER_API_KEY="${token}" "${CONTAINER_NAME}" \
+        goatcounter import -site=http://localhost:8080 -format=csv /tmp/tester-env-seed.csv
+    docker exec "${CONTAINER_NAME}" rm -f /tmp/tester-env-seed.csv 2>/dev/null || true
+    rm -rf "${tmp}"
+
+    echo "==> Waiting for persist (up to 90s)..."
+    local i n
+    for i in $(seq 1 30); do
+        n="$(db_count_hits)"
+        if [[ "${n}" == "${SEED_TOTAL}" ]]; then
+            break
+        fi
+        sleep 3
+    done
+    n="$(db_count_hits)"
+    if [[ "${n}" != "${SEED_TOTAL}" ]]; then
+        echo "FAIL: expected ${SEED_TOTAL} pageviews after import, have ${n}." >&2
+        return 1
+    fi
+    echo "==> Seed OK: ${n} pageviews, site ${VHOST}, admin ${ADMIN_EMAIL}, viewer ${VIEWER_EMAIL}."
+}
+
+cmd_verify() {
+    echo "==> Verifying deployment..."
+    local body
+    body="$(curl -fsL "http://localhost:${PORT}/")"
+    echo "${body}" | grep -qi "goatcounter" || {
+        echo "FAIL: landing page does not mention GoatCounter" >&2
+        return 1
+    }
+    # Login must yield an authenticated session (dashboard no longer shows login form).
+    local jar
+    jar="$(mktemp)"
+    curl -fs -c "${jar}" -b "${jar}" -L \
+        -d "email=${ADMIN_EMAIL}&password=${ADMIN_PASSWORD}" \
+        "http://localhost:${PORT}/user/requestlogin" -o /dev/null
+    local dash
+    dash="$(curl -fsL -b "${jar}" "http://localhost:${PORT}/")"
+    if echo "${dash}" | grep -qi "password\|/user/new"; then
+        rm -f "${jar}"
+        echo "FAIL: dashboard still shows login after POST /user/requestlogin" >&2
+        return 1
+    fi
+
+    fail() { rm -f "${jar}"; echo "FAIL: $1" >&2; return 1; }
+
+    # Seeded analytics: deterministic totals via aggregate tables
+    # (individual hits aggregate into hit_counts/hit_stats; hits table stays empty by design).
+    local total
+    total="$(db_count_hits)"
+    [[ "${total}" == "${SEED_TOTAL}" ]] || fail "expected ${SEED_TOTAL} seeded pageviews, have ${total}"
+
+    check_count() { # <label> <sql> <expected>
+        local got
+        got="$(db_query "$2" | sed -n 2p | tr -d '\r ')"
+        [[ "${got}" == "$3" ]] || fail "$1: expected $3, have ${got}"
+    }
+    # Per-path pageview counts.
+    check_count "path /"                   "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/'" "4"
+    check_count "path /pricing"            "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/pricing'" "4"
+    check_count "path /contact"            "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/contact'" "3"
+    check_count "path /blog/launch"        "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/blog/launch'" "4"
+    check_count "path /docs/getting-started" "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/docs/getting-started'" "5"
+    check_count "path /docs/api"           "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/docs/api'" "3"
+    # Dimensions: 5 distinct referrers, >=3 browser families, >=7 countries.
+    check_count "distinct referrers" "select count(distinct ref) from refs where ref<>''" "5"
+    local browsers countries
+    browsers="$(db_query "select count(distinct name) from browsers" | sed -n 2p | tr -d '\r ')"
+    [[ "${browsers}" -ge 3 ]] || fail "expected >=3 browsers, have ${browsers}"
+    countries="$(db_query "select count(distinct location) from location_stats" | sed -n 2p | tr -d '\r ')"
+    [[ "${countries}" -ge 7 ]] || fail "expected >=7 countries, have ${countries}"
+    # Config fixtures: read-only viewer + seed API token.
+    db_query "select email from users where email='${VIEWER_EMAIL}'" | grep -q "${VIEWER_EMAIL}" \
+        || fail "viewer user ${VIEWER_EMAIL} missing"
+    db_query "select name from api_tokens where name='${SEED_TOKEN_NAME}'" | grep -q "${SEED_TOKEN_NAME}" \
+        || fail "API token ${SEED_TOKEN_NAME} missing"
+
+    # Dashboard renders seeded paths server-side (proves UI visibility over HTTP).
+    for p in "/docs/getting-started" "/blog/launch" "/pricing"; do
+        echo "${dash}" | grep -q "${p}" || fail "dashboard HTML missing seeded path ${p}"
+    done
+    rm -f "${jar}"
+    echo "==> Verify OK: landing renders, login works, ${SEED_TOTAL} pageviews (6 paths, 5 referrers, ${browsers} browsers, ${countries} locations), viewer + token present."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+GoatCounter - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+   deploy    Build image, start container, create site + admin user
+   seed      Populate deterministic analytics (23 pageviews, viewer user, API token)
+   verify    Check landing/login plus seeded totals, paths, referrers, users
+  reset     Stop container, remove container and data volume
+  stop      Stop container (preserves data)
+  logs      Show container logs
+  status    Show container status
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate container and volume names for parallel runs.
+                  Default: default
+  --port <port>   Host port to bind to container port 8080.
+                  Default: 18181
+
+Credentials: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} (site ${VHOST})
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: $1"; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Unknown command: ${cmd}"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
