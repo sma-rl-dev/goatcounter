@@ -139,7 +139,10 @@ seed_ua() {
         chromeandroid) echo "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36" ;;
         safariiphone) echo "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1" ;;
         firefoxwin)   echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0" ;;
-        edgewin)      echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0" ;;
+        # EdgeHTML UA: gadget v1.0.0 only labels Edge from "Edge/" tokens, so a
+        # Chromium "Edg/" UA would collapse into the Chrome family and leave the
+        # Browsers widget with three families. This keeps a distinct fourth one.
+        edgewin)      echo "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19041" ;;
     esac
 }
 
@@ -278,11 +281,11 @@ cmd_verify() {
     check_count "path /blog/launch"        "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/blog/launch'" "4"
     check_count "path /docs/getting-started" "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/docs/getting-started'" "5"
     check_count "path /docs/api"           "select coalesce(sum(total),0) from hit_counts c join paths p using (path_id) where p.path='/docs/api'" "3"
-    # Dimensions: 5 distinct referrers, >=3 browser families, >=7 countries.
+    # Dimensions: 5 distinct referrers, 4 browser families, >=7 countries.
     check_count "distinct referrers" "select count(distinct ref) from refs where ref<>''" "5"
     local browsers countries
     browsers="$(db_query "select count(distinct name) from browsers" | sed -n 2p | tr -d '\r ')"
-    [[ "${browsers}" -ge 3 ]] || fail "expected >=3 browsers, have ${browsers}"
+    [[ "${browsers}" -ge 4 ]] || fail "expected >=4 browser families (Chrome/Safari/Firefox/Edge), have ${browsers}"
     countries="$(db_query "select count(distinct location) from location_stats" | sed -n 2p | tr -d '\r ')"
     [[ "${countries}" -ge 7 ]] || fail "expected >=7 countries, have ${countries}"
     # Config fixtures: read-only viewer + seed API token.

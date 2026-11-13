@@ -59,7 +59,7 @@ Site + admin user are created idempotently by `deploy` via `goatcounter db creat
 Seeded entities (deterministic, dates relative to seed time so the week-view dashboard stays populated):
 - 23 pageviews across 11 sessions and 6 paths (`/`, `/pricing`, `/contact`, `/blog/launch`, `/docs/getting-started`, `/docs/api`); theme: docs/product site for fictional SaaS "Acme Forms"
 - Per-path counts: `/`=4, `/pricing`=4, `/contact`=3, `/blog/launch`=4, `/docs/getting-started`=5, `/docs/api`=3
-- 5 distinct referrers, >=3 browser families, >=7 countries
+- 5 distinct referrers, 4 browser families (Chrome 12, Safari 6, Firefox 4, Edge 1), >=7 countries
 - Read-only viewer user + `tester-env-seed` (count perm) API token (config-element fixtures)
 
 Seed is idempotent on non-empty analytics; run `./tester-env reset && ./tester-env deploy && ./tester-env seed` for a clean reseed.
@@ -82,6 +82,7 @@ Checks:
 - Landing page renders and mentions GoatCounter
 - Admin login via `POST /user/requestlogin` yields an authenticated session (dashboard no longer shows login form)
 - `hit_counts` totals 23 pageviews with expected per-path counts
+- 4 distinct browser families, so the Browsers widget still has a second page at a page size of 3
 - Dashboard HTML renders seeded paths server-side (`/docs/getting-started`, `/blog/launch`, `/pricing`)
 
 Browser smoke (evidence-backed): dashboard shows 23 visits and 6 seeded paths; settings toggle round-trip verified.
